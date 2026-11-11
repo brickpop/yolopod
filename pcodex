@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# pcodex — run Codex CLI in the yolopod container, scoped to the current directory.
+#
+# Every argument is passed straight through to `codex`. The launcher's own
+# options are namespaced with --pcodex-* so they can never collide.
+set -euo pipefail
+
+NAME=pcodex
+PREFIX=PCODEX
+TOOL="Codex"
+FORWARD=(OPENAI_API_KEY OPENAI_BASE_URL CODEX_API_KEY CODEX_ACCESS_TOKEN)
+SHARE="${PCODEX_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/yolopod}"
+[ -f "$SHARE/lib.sh" ] || { echo "pcodex: no lib.sh in $SHARE — re-run install.sh from the repo" >&2; exit 1; }
+# shellcheck source=lib.sh
+source "$SHARE/lib.sh"
+
+harness_examples() {
+  cat <<'EOF'
+  pcodex                        Interactive session in the current directory
+  pcodex exec "fix the tests"   Non-interactive mode
+  pcodex resume --last          Any codex flag or subcommand
+EOF
+}
+
+# Codex keeps its login, config and sessions here; create it so Podman doesn't make it root-owned.
+harness_before() { mkdir -p "$HOME/.codex"; }
+
+harness_mounts() { volume "$HOME/.codex" /home/node/.codex; }
+
+# The container is the sandbox, so Codex's own (bubblewrap) one, which could not create
+# namespaces in here anyway, is always off; PCODEX_NO_YOLO only brings back the approval
+# prompts. --no-alt-screen keeps output in the terminal's scrollback, selectable and copyable.
+harness_cmd() {
+  if [ "$(opt NO_YOLO)" = 1 ]; then
+    cmd=(codex --no-alt-screen --sandbox danger-full-access --ask-for-approval on-request)
+  else
+    cmd=(codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox)
+  fi
+}
+
+harness_after() { :; }
+
+yolopod_main "$@"

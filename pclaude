@@ -1,45 +1,9 @@
 #!/usr/bin/env bash
-# pclaude — run Claude Code inside a Podman container, scoped to the current directory.
+# pclaude — run Claude Code in the yolopod container, scoped to the current directory.
 #
 # Every argument is passed straight through to `claude`. The launcher's own
 # options are namespaced with --pclaude-* so they can never collide.
 set -euo pipefail
-
-# Fully qualified so Podman resolves this locally instead of querying registries.
-IMAGE="${PCLAUDE_IMAGE:-localhost/pclaude}"
-SHARE="${PCLAUDE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/pclaude}"
-MODE="run"
-
-die() { printf 'pclaude: %s\n' "$*" >&2; exit 1; }
-
-usage() {
-  cat <<'EOF'
-Usage: pclaude [--pclaude-*] [claude args...]
-
-Everything that is not a --pclaude-* option goes to Claude Code untouched:
-  pclaude                       Interactive session in the current directory
-  pclaude -p "fix the tests"    Print mode
-  pclaude --model opus mcp list Any claude flag or subcommand
-
-Launcher options (before the claude args):
-  --pclaude-build    Build the image
-  --pclaude-update   Rebuild it from scratch (--pull --no-cache)
-  --pclaude-shell    Open a shell in the container instead of Claude
-  --pclaude-help     This message
-
-Environment:
-  PCLAUDE_IMAGE     Image name             (default: localhost/pclaude)
-  PCLAUDE_HOME      Dir holding Dockerfile (default: ~/.local/share/pclaude)
-  PCLAUDE_ARGS      Extra podman run args  (e.g. "-v /data:/data:z -e FOO=bar")
-  PCLAUDE_NO_YOLO   Set to 1 to drop --dangerously-skip-permissions
-  PCLAUDE_RELABEL   SELinux mount label: auto (default), z, Z or off
-EOF
-}
-
-build_image() {
-  [ -f "$SHARE/Dockerfile" ] || die "no Dockerfile in $SHARE — re-run install.sh from the repo"
-  podman build -t "$IMAGE" "$@" "$SHARE"
-}
 
 # One login for host and container. On macOS Claude Code keeps its login in the Keychain,
 # which the Linux container cannot reach; there it reads ~/.claude/.credentials.json. Every
@@ -89,92 +53,48 @@ sync_credentials() {
 # Sourcing the launcher (as test.sh does) only loads the functions above.
 (return 0 2>/dev/null) && return
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --pclaude-help)   usage; exit 0 ;;
-    --pclaude-build)  MODE="build"; shift ;;
-    --pclaude-update) MODE="update"; shift ;;
-    --pclaude-shell)  MODE="shell"; shift ;;
-    *) break ;;
-  esac
-done
+NAME=pclaude
+PREFIX=PCLAUDE
+TOOL="Claude Code"
+FORWARD=(ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL
+         CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX)
+SHARE="${PCLAUDE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/yolopod}"
+[ -f "$SHARE/lib.sh" ] || { echo "pclaude: no lib.sh in $SHARE — re-run install.sh from the repo" >&2; exit 1; }
+# shellcheck source=lib.sh
+source "$SHARE/lib.sh"
 
-case "$MODE" in
-  build)  build_image "$@"; exit 0 ;;
-  update) build_image --pull --no-cache "$@"; exit 0 ;;
-esac
+harness_examples() {
+  cat <<'EOF'
+  pclaude                       Interactive session in the current directory
+  pclaude -p "fix the tests"    Print mode
+  pclaude --model opus mcp list Any claude flag or subcommand
+EOF
+}
 
-if ! podman image exists "$IMAGE"; then
-  echo "pclaude: image $IMAGE not found, building it once..." >&2
-  build_image
-fi
+macos() { [ "$(uname -s)" = Darwin ]; }
 
-# Guard against relabelling / exposing an entire home directory by accident.
-case "$PWD" in
-  /) die "refusing to run in /" ;;
-  "$HOME") [ "${PCLAUDE_ALLOW_HOME:-}" = 1 ] || die "refusing to mount all of \$HOME (set PCLAUDE_ALLOW_HOME=1 to override)" ;;
-esac
+harness_before() {
+  # Claude Code stores its state here; create both so Podman doesn't make them dirs.
+  mkdir -p "$HOME/.claude"
+  [ -e "$HOME/.claude.json" ] || echo '{}' >"$HOME/.claude.json"
+  if macos; then
+    sync_credentials || die "not logged in — run 'claude /login' on the host, then rerun pclaude"
+  fi
+}
 
-# Claude Code stores its state here; create both so Podman doesn't make them dirs.
-mkdir -p "$HOME/.claude"
-[ -e "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
+harness_mounts() {
+  volume "$HOME/.claude" /home/node/.claude
+  volume "$HOME/.claude.json" /home/node/.claude.json
+}
 
-[ "$(uname -s)" = Darwin ] && MACOS=1 || MACOS=""
-if [ -n "$MACOS" ]; then
-  sync_credentials || die "not logged in — run 'claude /login' on the host, then rerun pclaude"
-fi
-
-# SELinux hosts (Fedora, RHEL...) need a relabel suffix on bind mounts:
-#   PCLAUDE_RELABEL=z    shared label, lets concurrent sessions share ~/.claude
-#   PCLAUDE_RELABEL=Z    private label, stricter, for one session at a time
-#   PCLAUDE_RELABEL=off  plain bind mounts
-relabel="${PCLAUDE_RELABEL:-auto}"
-if [ "$relabel" = auto ]; then
-  if [ -f /sys/fs/selinux/enforce ]; then relabel=z; else relabel=off; fi
-fi
-case "$relabel" in
-  z|Z) Z="$relabel" ;;
-  off) Z="" ;;
-  *)   die "PCLAUDE_RELABEL must be z, Z, off or auto" ;;
-esac
-
-# The project keeps its host path inside the container, so Claude's per-project
-# session history is keyed the same way it is on the host.
-args=(
-  --rm --interactive --tty
-  --hostname pclaude
-  --userns "keep-id:uid=1000,gid=1000"
-  --volume "$PWD:$PWD${Z:+:$Z}"
-  --workdir "$PWD"
-  --volume "$HOME/.claude:/home/node/.claude${Z:+:$Z}"
-  --volume "$HOME/.claude.json:/home/node/.claude.json${Z:+:$Z}"
-)
-
-if [ -f "$HOME/.gitconfig" ]; then
-  args+=(--volume "$HOME/.gitconfig:/home/node/.gitconfig:ro${Z:+,$Z}")
-fi
-
-for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL \
-           CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX GH_TOKEN TERM COLORTERM; do
-  if [ -n "${!var-}" ]; then args+=(--env "$var=${!var}"); fi
-done
-
-# Word-split PCLAUDE_ARGS the way a shell would.
-if [ -n "${PCLAUDE_ARGS:-}" ]; then
-  read -r -a extra <<<"$PCLAUDE_ARGS"
-  args+=("${extra[@]}")
-fi
-
-# Name the command explicitly, so any other one can replace it.
-if [ "$MODE" = "shell" ]; then
-  cmd=(bash)
-else
+harness_cmd() {
   cmd=(claude)
-  [ "${PCLAUDE_NO_YOLO:-}" = 1 ] || cmd+=(--dangerously-skip-permissions)
-fi
+  [ "$(opt NO_YOLO)" = 1 ] || cmd+=(--dangerously-skip-permissions)
+}
 
-# No exec: once the container exits, hand any token it refreshed back to the Keychain.
-status=0
-podman run "${args[@]}" "$IMAGE" "${cmd[@]}" "$@" || status=$?
-if [ -n "$MACOS" ]; then sync_credentials || true; fi
-exit "$status"
+# Hand any token the container refreshed back to the Keychain.
+harness_after() {
+  if macos; then sync_credentials || true; fi
+}
+
+yolopod_main "$@"

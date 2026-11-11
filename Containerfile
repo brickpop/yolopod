@@ -13,7 +13,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       vim \
       just \
       procps \
+      python3 \
+      python3-pip \
+      python3-venv \
   && rm -rf /var/lib/apt/lists/*
+
+# uv, from its official image. Debian's python3 refuses a global `pip install` (PEP 668),
+# so use `uv` (or a venv) to install Python packages and tools.
+ARG UV_VERSION=latest
+COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /uvx /usr/local/bin/
 
 # Go, pinned via build arg or resolved at build time with "latest".
 ARG GO_VERSION=latest
@@ -27,7 +35,7 @@ RUN set -eux; \
     rm /tmp/go.tgz /usr/local/go/test /usr/local/go/api -rf; \
     /usr/local/go/bin/go version
 
-ARG WIKI_VERSION=v0.10.0
+ARG WIKI_VERSION=v0.17.0
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     mkdir -p /tmp/wiki && cd /tmp/wiki && \
@@ -41,11 +49,12 @@ ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global \
     GOPATH=/home/node/go \
     DENO_INSTALL=/home/node/.deno \
     BUN_INSTALL=/home/node/.bun \
-    PATH=/usr/local/share/npm-global/bin:/usr/local/go/bin:/home/node/go/bin:/home/node/.foundry/bin:/home/node/.deno/bin:/home/node/.bun/bin:$PATH \
+    PATH=/usr/local/share/npm-global/bin:/usr/local/go/bin:/home/node/go/bin:/home/node/.foundry/bin:/home/node/.deno/bin:/home/node/.bun/bin:/home/node/.local/bin:$PATH \
     DEVCONTAINER=true
 
-RUN mkdir -p /usr/local/share/npm-global /home/node/.claude \
-  && chown -R node:node /usr/local/share/npm-global /home/node/.claude
+# The harness config dirs are bind-mounted over these; they exist so they're owned by node.
+RUN mkdir -p /usr/local/share/npm-global /home/node/.claude /home/node/.codex \
+  && chown -R node:node /usr/local/share/npm-global /home/node/.claude /home/node/.codex
 
 USER node
 
@@ -61,14 +70,20 @@ RUN curl -fsSL https://foundry.paradigm.xyz | bash \
        if [ -f "$f" ]; then ln -f "$f" "/home/node/.foundry/bin/$(basename "$f")"; fi; \
      done
 
-# Last, because it moves fastest: a version bump reuses every layer above.
+# The harnesses go last, because they move fastest: a version bump reuses every layer
+# above. One layer each, so bumping one doesn't reinstall the other.
+ARG CODEX_VERSION=latest
+RUN npm install -g @openai/codex@${CODEX_VERSION} \
+  && npm cache clean --force
+
 ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
   && npm cache clean --force
 
-RUN forge --version && deno --version && bun --version && go version && claude --version && wiki --version
+RUN forge --version && deno --version && bun --version && go version && wiki --version \
+  && python3 --version && uv --version && codex --version && claude --version
 
-# The command is exactly what you pass, and defaults to Claude.
-# pclaude bind-mounts each project at its host path and passes a matching --workdir.
+# The command is exactly what you pass; with none, a shell. The launchers bind-mount
+# each project at its host path and pass a matching --workdir.
 ENTRYPOINT []
-CMD ["claude"]
+CMD ["bash"]
